@@ -121,6 +121,8 @@ Examples: "todo-app-3847", "weather-dash-9201", "recipe-finder-5512"
 - If deploy fails, analyze the error, fix the root cause, and retry — up to 3 times
 - Never give up without trying at least 2 deploy attempts
 
+CRITICAL RULE: You MUST call deploy_to_netlify before ending. Never call end_turn without having successfully deployed. If you have written files but not deployed, deploy immediately. Deployment is not optional — it is the final required step every time.
+
 Today's date: ${new Date().toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata' })}
 `;
 
@@ -259,11 +261,27 @@ async function runAgent(requirement, jobId) {
         finalSummary = textBlock?.text || 'App built and deployed successfully.';
 
         if (!deployedUrl) {
-          // Edge case: agent said it's done but no URL captured
-          return {
-            success: false,
-            error: 'Agent finished but no deployment URL was found. The app may not have been deployed.'
-          };
+          // Agent finished without deploying — force a deploy now
+          console.log(`[Job ${jobId}] ⚠️ end_turn with no deploy — forcing deploy_to_netlify`);
+          const fallbackSiteName = `auto-deploy-${Math.floor(Math.random() * 9000 + 1000)}`;
+          const deployResult = await executeTool(
+            'deploy_to_netlify',
+            { deploy_dir: '.', site_name: fallbackSiteName },
+            jobDir,
+            jobId
+          );
+          if (deployResult.includes('"success":true')) {
+            try {
+              const parsed = JSON.parse(deployResult);
+              if (parsed.url) deployedUrl = parsed.url;
+            } catch {}
+          }
+          if (!deployedUrl) {
+            return {
+              success: false,
+              error: `Agent ended without deploying and forced deploy also failed: ${deployResult}`
+            };
+          }
         }
         break;
       }

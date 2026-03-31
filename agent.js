@@ -184,16 +184,22 @@ async function executeTool(toolName, toolInput, jobDir, jobId) {
           .replace(/-+/g, '-')
           .slice(0, 63);
 
+        console.log(`[Job ${jobId}] 📦 Deploying dir="${fullDeployDir}" site="${siteName}"`);
         try {
           const result = await deployToNetlify(
             fullDeployDir,
             siteName,
             process.env.NETLIFY_AUTH_TOKEN
           );
+          const resultStr = JSON.stringify({ success: true, url: result.url, site_id: result.siteId });
           console.log(`[Job ${jobId}] 🚀 Deployed: ${result.url}`);
-          return JSON.stringify({ success: true, url: result.url, site_id: result.siteId });
+          console.log(`[Job ${jobId}] 📤 Deploy result: ${resultStr}`);
+          return resultStr;
         } catch (err) {
-          return `DEPLOY_ERROR: ${err.message}`;
+          const errMsg = `DEPLOY_ERROR: ${err.message}`;
+          console.error(`[Job ${jobId}] ❌ Deploy failed: ${err.message}`);
+          console.error(`[Job ${jobId}] ❌ Deploy stack: ${err.stack}`);
+          return errMsg;
         }
       }
 
@@ -263,6 +269,7 @@ async function runAgent(requirement, jobId) {
         if (!deployedUrl) {
           // Agent finished without deploying — force a deploy now
           console.log(`[Job ${jobId}] ⚠️ end_turn with no deploy — forcing deploy_to_netlify`);
+          console.log(`[Job ${jobId}] ⚠️ jobDir contents: ${fs.readdirSync(jobDir).join(', ')}`);
           const fallbackSiteName = `auto-deploy-${Math.floor(Math.random() * 9000 + 1000)}`;
           const deployResult = await executeTool(
             'deploy_to_netlify',
@@ -270,6 +277,7 @@ async function runAgent(requirement, jobId) {
             jobDir,
             jobId
           );
+          console.log(`[Job ${jobId}] ⚠️ Forced deploy result: ${deployResult}`);
           if (deployResult.includes('"success":true')) {
             try {
               const parsed = JSON.parse(deployResult);
@@ -333,7 +341,8 @@ async function runAgent(requirement, jobId) {
     };
 
   } catch (err) {
-    console.error(`[Job ${jobId}] ❌ Agent error:`, err.message);
+    console.error(`[Job ${jobId}] ❌ Agent error: ${err.message}`);
+    console.error(`[Job ${jobId}] ❌ Agent stack: ${err.stack}`);
     return { success: false, error: `Agent error: ${err.message}` };
 
   } finally {

@@ -84,12 +84,15 @@ app.post('/webhook', async (req, res) => {
       setTimeout(() => jobs.delete(jobId), 10 * 60 * 1000);
     })
     .catch(err => {
-      console.error(`[Job ${jobId}] Fatal error:`, err.message);
+      console.error(`[Job ${jobId}] Fatal error: ${err.message}`);
+      console.error(`[Job ${jobId}] Fatal stack: ${err.stack}`);
       twilioClient.messages.create({
         from: process.env.TWILIO_WHATSAPP_FROM,
         to: from,
         body: `❌ Something went wrong on my end: ${err.message}\n\nTry again!`
-      }).catch(() => {});
+      }).catch(twilioErr => {
+        console.error(`[Job ${jobId}] ALSO failed to send WhatsApp error reply: ${twilioErr.message}`);
+      });
     });
 });
 

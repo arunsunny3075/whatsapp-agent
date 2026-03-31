@@ -111,14 +111,14 @@ async function deployToNetlify(deployDir, siteName, authToken) {
 /*.css
   Content-Type: text/css
 `;
-    fs.writeFileSync(path.join(fullDeployDir, '_headers'), headersContent, 'utf8');
+    fs.writeFileSync(path.join(deployDir, '_headers'), headersContent, 'utf8');
 
     const tomlContent = `[[headers]]
   for = "/*"
   [headers.values]
     Content-Type = "text/html; charset=utf-8"
 `;
-    fs.writeFileSync(path.join(fullDeployDir, 'netlify.toml'), tomlContent, 'utf8');
+    fs.writeFileSync(path.join(deployDir, 'netlify.toml'), tomlContent, 'utf8');
 
     console.log(`  [Netlify] Zipping: ${deployDir}`);
     await zipDirectory(deployDir, zipPath);

@@ -98,6 +98,28 @@ async function deployToNetlify(deployDir, siteName, authToken) {
   const zipPath = path.join(os.tmpdir(), `netlify-deploy-${Date.now()}.zip`);
 
   try {
+    // Write Netlify config files for correct Content-Type headers
+    const headersContent = `/*
+  Content-Type: text/html; charset=utf-8
+
+/*.html
+  Content-Type: text/html; charset=utf-8
+
+/*.js
+  Content-Type: application/javascript
+
+/*.css
+  Content-Type: text/css
+`;
+    fs.writeFileSync(path.join(fullDeployDir, '_headers'), headersContent, 'utf8');
+
+    const tomlContent = `[[headers]]
+  for = "/*"
+  [headers.values]
+    Content-Type = "text/html; charset=utf-8"
+`;
+    fs.writeFileSync(path.join(fullDeployDir, 'netlify.toml'), tomlContent, 'utf8');
+
     console.log(`  [Netlify] Zipping: ${deployDir}`);
     await zipDirectory(deployDir, zipPath);
 

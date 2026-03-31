@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: whatsapp-agent
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: NETLIFY_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_WHATSAPP_FROM
+        sync: false
+      - key: ALLOWED_WHATSAPP_NUMBER
+        sync: false

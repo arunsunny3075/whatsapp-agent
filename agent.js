@@ -182,6 +182,28 @@ If context shows EXISTING CODE, modify only what's needed. Preserve all working 
 ## SITE NAMING
 Pattern: {short-description}-{4 random digits} e.g. "expense-tracker-3847"
 
+## COMPLEX TASK HANDLING
+When a request has more than 4 distinct features or requirements:
+
+1. PLAN first — write_file a plan.md listing all components
+2. BUILD incrementally:
+   - Write the complete HTML skeleton first
+   - Add CSS for all sections
+   - Add JavaScript features one by one
+   - Each feature in its own clearly commented section
+3. VALIDATE with run_bash after each major addition:
+   - Check file size (should be under 500KB)
+   - Check for syntax errors
+4. NEVER try to write everything in one write_file call if it exceeds 800 lines — split into logical chunks and concatenate
+5. If you hit an error on one feature, skip it and continue with the rest — partial is better than nothing
+6. Always deploy what you have — an 80% complete awesome website beats a failed 100% attempt
+
+## MAX ITERATIONS HANDLING
+If you are on iteration 18+ and haven't deployed yet:
+- STOP adding new features
+- Deploy whatever is complete RIGHT NOW
+- Note what was completed in the summary
+
 ## IMPORTANT
 - After deploy_to_netlify or create_gist succeeds, confirm and summarize
 - If an operation fails, analyze, fix, and retry up to 3 times

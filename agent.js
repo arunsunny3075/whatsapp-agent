@@ -9,7 +9,7 @@ const fs = require('fs');
 const path = require('path');
 const { execSync } = require('child_process');
 const os = require('os');
-const { deployToNetlify } = require('./deploy');
+const { deployToNetlify, deployToExistingSite } = require('./deploy');
 
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
@@ -68,7 +68,7 @@ const TOOLS = [
   },
   {
     name: 'deploy_to_netlify',
-    description: 'Deploy the app to Netlify and get a live HTTPS URL. Call this ONLY when all files are complete and error-free. Returns the live URL on success.',
+    description: 'Deploy the app to Netlify and get a live HTTPS URL. For NEW apps: provide deploy_dir and site_name. For UPDATES to existing apps: also provide site_id (the existing Netlify site ID) — this redeploys to the same URL without creating a new site.',
     input_schema: {
       type: 'object',
       properties: {
@@ -79,6 +79,10 @@ const TOOLS = [
         site_name: {
           type: 'string',
           description: 'Netlify site name: lowercase letters, numbers, hyphens only. Max 63 chars. Example: "expense-tracker-8472"'
+        },
+        site_id: {
+          type: 'string',
+          description: 'Optional. Existing Netlify site ID for updates. When provided, deploys to this site instead of creating a new one.'
         }
       },
       required: ['deploy_dir', 'site_name']
@@ -184,14 +188,14 @@ async function executeTool(toolName, toolInput, jobDir, jobId) {
           .replace(/-+/g, '-')
           .slice(0, 63);
 
-        console.log(`[Job ${jobId}] 📦 Deploying dir="${fullDeployDir}" site="${siteName}"`);
+        console.log(`[Job ${jobId}] 📦 Deploying dir="${fullDeployDir}" site="${siteName}" existing_id="${toolInput.site_id || 'none'}"`);
         try {
-          const result = await deployToNetlify(
-            fullDeployDir,
-            siteName,
-            process.env.NETLIFY_AUTH_TOKEN
-          );
-          const resultStr = JSON.stringify({ success: true, url: result.url, site_id: result.siteId });
+          // Use existing site if site_id provided (update), otherwise create new
+          const result = toolInput.site_id
+            ? await deployToExistingSite(toolInput.site_id, fullDeployDir, process.env.NETLIFY_AUTH_TOKEN)
+            : await deployToNetlify(fullDeployDir, siteName, process.env.NETLIFY_AUTH_TOKEN);
+
+          const resultStr = JSON.stringify({ success: true, url: result.url, site_id: result.siteId, site_name: result.siteName });
           console.log(`[Job ${jobId}] 🚀 Deployed: ${result.url}`);
           console.log(`[Job ${jobId}] 📤 Deploy result: ${resultStr}`);
           return resultStr;
@@ -229,18 +233,32 @@ function getAllFiles(dir, baseDir) {
 }
 
 // ── Main agent function ──────────────────────────────────────
-async function runAgent(requirement, jobId) {
+// imageData = { base64: '...', mediaType: 'image/jpeg' } | null
+// existingSiteId = Netlify site ID string for update jobs | null
+async function runAgent(requirement, jobId, imageData = null, existingSiteId = null) {
   const jobDir = path.join(os.tmpdir(), `agent-job-${jobId}`);
   fs.mkdirSync(jobDir, { recursive: true });
 
   console.log(`[Job ${jobId}] 🚀 Starting agent`);
-  console.log(`[Job ${jobId}] 📋 Task: ${requirement}`);
+  console.log(`[Job ${jobId}] 📋 Task: ${requirement.slice(0, 120)}`);
+  if (imageData) console.log(`[Job ${jobId}] 🖼️ Image attached (${imageData.mediaType})`);
+  if (existingSiteId) console.log(`[Job ${jobId}] 🔄 Update mode: site ${existingSiteId}`);
+
+  // Build the first message — with image if provided
+  const firstUserContent = imageData
+    ? [
+        { type: 'image', source: { type: 'base64', media_type: imageData.mediaType, data: imageData.base64 } },
+        { type: 'text', text: requirement }
+      ]
+    : requirement;
 
   const messages = [
-    { role: 'user', content: requirement }
+    { role: 'user', content: firstUserContent }
   ];
 
   let deployedUrl = null;
+  let deployedSiteId = existingSiteId || null;
+  let deployedSiteName = null;
   let finalSummary = '';
   const MAX_ITERATIONS = 25; // Safety limit
 
@@ -282,6 +300,8 @@ async function runAgent(requirement, jobId) {
             try {
               const parsed = JSON.parse(deployResult);
               if (parsed.url) deployedUrl = parsed.url;
+              if (parsed.site_id) deployedSiteId = parsed.site_id;
+              if (parsed.site_name) deployedSiteName = parsed.site_name;
             } catch {}
           }
           if (!deployedUrl) {
@@ -303,11 +323,13 @@ async function runAgent(requirement, jobId) {
 
           const result = await executeTool(block.name, block.input, jobDir, jobId);
 
-          // Extract deployed URL when deploy succeeds
+          // Extract deployed URL + site info when deploy succeeds
           if (block.name === 'deploy_to_netlify' && result.includes('"success":true')) {
             try {
               const parsed = JSON.parse(result);
               if (parsed.url) deployedUrl = parsed.url;
+              if (parsed.site_id) deployedSiteId = parsed.site_id;
+              if (parsed.site_name) deployedSiteName = parsed.site_name;
             } catch {}
           }
 
@@ -337,7 +359,9 @@ async function runAgent(requirement, jobId) {
     return {
       success: true,
       url: deployedUrl,
-      summary: finalSummary.slice(0, 500) // Keep WhatsApp message reasonable
+      siteId: deployedSiteId,
+      siteName: deployedSiteName,
+      summary: finalSummary.slice(0, 500)
     };
 
   } catch (err) {

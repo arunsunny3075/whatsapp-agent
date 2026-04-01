@@ -158,4 +158,57 @@ async function deployToNetlify(deployDir, siteName, authToken) {
   }
 }
 
-module.exports = { deployToNetlify };
+// ── Deploy a zip to an EXISTING Netlify site (for updates) ──
+async function deployToExistingSite(siteId, deployDir, authToken) {
+  const zipPath = path.join(os.tmpdir(), `netlify-update-${Date.now()}.zip`);
+
+  try {
+    // Write config files same as new deployments
+    const headersContent = `/*
+  Content-Type: text/html; charset=utf-8
+
+/*.html
+  Content-Type: text/html; charset=utf-8
+
+/*.js
+  Content-Type: application/javascript
+
+/*.css
+  Content-Type: text/css
+`;
+    fs.writeFileSync(path.join(deployDir, '_headers'), headersContent, 'utf8');
+    const tomlContent = `[[headers]]
+  for = "/*"
+  [headers.values]
+    Content-Type = "text/html; charset=utf-8"
+`;
+    fs.writeFileSync(path.join(deployDir, 'netlify.toml'), tomlContent, 'utf8');
+
+    console.log(`  [Netlify] Updating site ${siteId}: ${deployDir}`);
+    await zipDirectory(deployDir, zipPath);
+
+    const zipSize = fs.statSync(zipPath).size;
+    console.log(`  [Netlify] Update zip size: ${(zipSize / 1024).toFixed(1)} KB`);
+
+    // Fetch site info (to get the site URL)
+    const siteRes = await fetch(`${NETLIFY_API}/sites/${siteId}`, {
+      headers: { Authorization: `Bearer ${authToken}` }
+    });
+    if (!siteRes.ok) throw new Error(`Could not fetch site info: ${siteRes.status}`);
+    const site = await siteRes.json();
+
+    const deploy = await deployZip(siteId, zipPath, authToken);
+    console.log(`  [Netlify] Update deploy started: ${deploy.id}`);
+
+    const readyDeploy = await waitForDeploy(deploy.id, authToken);
+    const liveUrl = readyDeploy.deploy_ssl_url || readyDeploy.url || `https://${site.name}.netlify.app`;
+
+    console.log(`  [Netlify] ✅ Updated at: ${liveUrl}`);
+    return { url: liveUrl, siteId: site.id, siteName: site.name };
+
+  } finally {
+    try { fs.unlinkSync(zipPath); } catch {}
+  }
+}
+
+module.exports = { deployToNetlify, deployToExistingSite };

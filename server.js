@@ -453,13 +453,199 @@ app.post('/webhook', async (req, res) => {
   runAgentJob(from, msgBody, jobId);
 });
 
+// ════════════════════════════════════════════════════════════
+//  MARKET DATA PROXY  (/market/*)
+//  Fetches from Yahoo Finance server-side (no CORS issues).
+//  Render's IP is not blocked by Yahoo Finance.
+// ════════════════════════════════════════════════════════════
+
+const marketCache = {};   // { key: { data, expiresAt } }
+
+function cacheGet(key) {
+  const entry = marketCache[key];
+  if (entry && Date.now() < entry.expiresAt) return entry.data;
+  return null;
+}
+
+function cacheSet(key, data, ttlMs) {
+  marketCache[key] = { data, expiresAt: Date.now() + ttlMs };
+}
+
+const YF_HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+  'Accept': 'application/json',
+  'Accept-Language': 'en-US,en;q=0.9'
+};
+
+async function fetchYahoo(path) {
+  const hosts = ['query1.finance.yahoo.com', 'query2.finance.yahoo.com'];
+  let lastErr;
+  for (const host of hosts) {
+    try {
+      const res = await fetch(`https://${host}${path}`, {
+        headers: YF_HEADERS,
+        signal: AbortSignal.timeout(10000)
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return await res.json();
+    } catch (err) {
+      lastErr = err;
+      console.warn(`[Market] ${host} failed: ${err.message}, trying next...`);
+    }
+  }
+  throw lastErr;
+}
+
+function extractQuote(data, symbol) {
+  const result = data?.chart?.result?.[0];
+  if (!result) throw new Error(`No data for ${symbol}`);
+  const meta = result.meta;
+  return {
+    symbol: meta.symbol || symbol,
+    shortName: meta.shortName || meta.symbol || symbol,
+    regularMarketPrice: meta.regularMarketPrice || meta.chartPreviousClose || null,
+    regularMarketChange: meta.regularMarketPrice && meta.chartPreviousClose
+      ? parseFloat((meta.regularMarketPrice - meta.chartPreviousClose).toFixed(2))
+      : null,
+    regularMarketChangePercent: meta.regularMarketPrice && meta.chartPreviousClose
+      ? parseFloat(((meta.regularMarketPrice - meta.chartPreviousClose) / meta.chartPreviousClose * 100).toFixed(2))
+      : null,
+    regularMarketVolume: meta.regularMarketVolume || null,
+    fiftyTwoWeekHigh: meta.fiftyTwoWeekHigh || null,
+    fiftyTwoWeekLow: meta.fiftyTwoWeekLow || null,
+    currency: meta.currency || 'INR',
+    exchangeName: meta.exchangeName || null,
+    marketState: meta.marketState || 'UNKNOWN',
+    previousClose: meta.chartPreviousClose || null
+  };
+}
+
+// CORS middleware for all /market routes
+app.use('/market', (req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Headers', 'Content-Type');
+  res.header('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  next();
+});
+
+// GET /market/quote?symbols=^NSEI,^NSEBANK,RELIANCE.NS
+app.get('/market/quote', async (req, res) => {
+  const symbolsParam = req.query.symbols || '^NSEI,^NSEBANK,^BSESN,RELIANCE.NS,TCS.NS';
+  const symbols = symbolsParam.split(',').map(s => s.trim()).filter(Boolean);
+  const cacheKey = `quote:${symbols.join(',')}`;
+
+  const cached = cacheGet(cacheKey);
+  if (cached) return res.json(cached);
+
+  try {
+    const results = await Promise.allSettled(
+      symbols.map(async sym => {
+        const encoded = encodeURIComponent(sym);
+        const data = await fetchYahoo(`/v8/finance/chart/${encoded}?interval=1m&range=1d`);
+        return extractQuote(data, sym);
+      })
+    );
+
+    const quotes = results
+      .map((r, i) => r.status === 'fulfilled' ? r.value : { symbol: symbols[i], error: r.reason?.message })
+      .filter(Boolean);
+
+    cacheSet(cacheKey, quotes, 60 * 1000); // 60 second cache
+    res.json(quotes);
+  } catch (err) {
+    console.error('[Market /quote] Error:', err.message);
+    res.status(502).json({ error: 'Failed to fetch quotes', detail: err.message });
+  }
+});
+
+// GET /market/history?symbol=^NSEI&interval=1d&range=1mo
+app.get('/market/history', async (req, res) => {
+  const symbol   = req.query.symbol   || '^NSEI';
+  const interval = req.query.interval || '1d';
+  const range    = req.query.range    || '1mo';
+  const cacheKey = `history:${symbol}:${interval}:${range}`;
+
+  const cached = cacheGet(cacheKey);
+  if (cached) return res.json(cached);
+
+  try {
+    const encoded = encodeURIComponent(symbol);
+    const data = await fetchYahoo(`/v8/finance/chart/${encoded}?interval=${interval}&range=${range}`);
+    const result = data?.chart?.result?.[0];
+    if (!result) throw new Error(`No history data for ${symbol}`);
+
+    const { timestamp, indicators } = result;
+    const quote = indicators?.quote?.[0] || {};
+
+    const payload = {
+      symbol,
+      interval,
+      range,
+      meta: {
+        currency: result.meta?.currency,
+        regularMarketPrice: result.meta?.regularMarketPrice,
+        chartPreviousClose: result.meta?.chartPreviousClose
+      },
+      timestamps: timestamp || [],
+      open:   quote.open   || [],
+      high:   quote.high   || [],
+      low:    quote.low    || [],
+      close:  quote.close  || [],
+      volume: quote.volume || []
+    };
+
+    cacheSet(cacheKey, payload, 5 * 60 * 1000); // 5 minute cache
+    res.json(payload);
+  } catch (err) {
+    console.error('[Market /history] Error:', err.message);
+    res.status(502).json({ error: 'Failed to fetch history', detail: err.message });
+  }
+});
+
+// GET /market/indices  — NIFTY50, BANKNIFTY, SENSEX, NIFTY IT
+app.get('/market/indices', async (req, res) => {
+  const INDEX_SYMBOLS = [
+    { symbol: '^NSEI',   name: 'NIFTY 50'    },
+    { symbol: '^NSEBANK',name: 'BANK NIFTY'  },
+    { symbol: '^BSESN',  name: 'SENSEX'      },
+    { symbol: '^CNXIT',  name: 'NIFTY IT'    }
+  ];
+  const cacheKey = 'indices';
+  const cached = cacheGet(cacheKey);
+  if (cached) return res.json(cached);
+
+  try {
+    const results = await Promise.allSettled(
+      INDEX_SYMBOLS.map(async ({ symbol, name }) => {
+        const encoded = encodeURIComponent(symbol);
+        const data = await fetchYahoo(`/v8/finance/chart/${encoded}?interval=1m&range=1d`);
+        const quote = extractQuote(data, symbol);
+        return { ...quote, displayName: name };
+      })
+    );
+
+    const indices = results.map((r, i) =>
+      r.status === 'fulfilled'
+        ? r.value
+        : { symbol: INDEX_SYMBOLS[i].symbol, displayName: INDEX_SYMBOLS[i].name, error: r.reason?.message }
+    );
+
+    cacheSet(cacheKey, indices, 60 * 1000); // 60 second cache
+    res.json(indices);
+  } catch (err) {
+    console.error('[Market /indices] Error:', err.message);
+    res.status(502).json({ error: 'Failed to fetch indices', detail: err.message });
+  }
+});
+
 // ── GET /health ──────────────────────────────────────────────
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
     activeJobs: [...jobs.values()].filter(j => j.status === 'running').length,
     uptime: Math.floor(process.uptime()) + 's',
-    features: ['text', 'voice', 'image', 'history', 'update', 'users']
+    features: ['text', 'voice', 'image', 'history', 'update', 'users', 'market-proxy']
   });
 });
 

@@ -1,25 +1,27 @@
 // ============================================================
 //  server.js  –  WhatsApp AI Agent Server
-//  Receives WhatsApp messages via Twilio, runs Claude agent,
-//  deploys to Netlify, and replies with the live URL.
 //
-//  Supports: text requirements, voice notes (Groq Whisper),
-//  screenshots (Claude Vision), app history, update commands,
-//  multi-user credit system.
+//  Phase 2 features:
+//  • Upgrade 1: GitHub Gist output for code files
+//  • Upgrade 2: Multi-step conversation memory
+//  • Upgrade 3: Smarter system prompt (handled in agent.js)
+//  • Upgrade 4: Voice prompt enhancer (Groq LLM)
+//  • Market proxy: /market/quote, /market/history, /market/indices
 // ============================================================
 
 require('dotenv').config();
-const express = require('express');
+const express    = require('express');
 const bodyParser = require('body-parser');
-const twilio = require('twilio');
-const fs = require('fs');
-const path = require('path');
-const os = require('os');
-const Groq = require('groq-sdk');
+const twilio     = require('twilio');
+const fs         = require('fs');
+const path       = require('path');
+const os         = require('os');
+const Groq       = require('groq-sdk');
 
-const { runAgent } = require('./agent');
+const { runAgent }   = require('./agent');
 const { saveDeployment, getLastDeployment, getAllDeployments, deleteDeployment } = require('./storage');
-const { getUser, registerUser, deductCredit, addCredits, getAllUsers, isOwner } = require('./users');
+const { getUser, registerUser, deductCredit, addCredits, getAllUsers, isOwner }  = require('./users');
+const { getConversation, saveConversation } = require('./conversations');
 
 const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
@@ -28,7 +30,7 @@ app.use(bodyParser.json());
 // ── Clients ─────────────────────────────────────────────────
 const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 
-// Groq is lazily initialized so missing key doesn't crash startup
+// Groq — lazy init so missing key doesn't crash startup
 let _groq = null;
 function getGroq() {
   if (!process.env.GROQ_API_KEY) throw new Error('GROQ_API_KEY not set — add it in Render env vars');
@@ -57,12 +59,10 @@ async function sendWhatsApp(to, body) {
   });
 }
 
-// Download media from Twilio URL using Basic Auth
 async function downloadTwilioMedia(mediaUrl) {
   const auth = Buffer.from(
     `${process.env.TWILIO_ACCOUNT_SID}:${process.env.TWILIO_AUTH_TOKEN}`
   ).toString('base64');
-
   const response = await fetch(mediaUrl, {
     headers: { Authorization: `Basic ${auth}` }
   });
@@ -70,7 +70,6 @@ async function downloadTwilioMedia(mediaUrl) {
   return response;
 }
 
-// Fetch existing HTML from a live Netlify site for update jobs
 async function fetchExistingCode(siteUrl) {
   try {
     const urls = [
@@ -87,8 +86,95 @@ async function fetchExistingCode(siteUrl) {
   }
 }
 
+// Fetch raw code from a GitHub Gist
+async function fetchGistCode(rawUrl) {
+  try {
+    const res = await fetch(rawUrl, { signal: AbortSignal.timeout(10000) });
+    if (res.ok) return (await res.text()).slice(0, 50000);
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 // ════════════════════════════════════════════════════════════
-//  CORE JOB RUNNER  (called after Twilio has been ACK'd)
+//  UPGRADE 4 — VOICE PROMPT ENHANCER
+// ════════════════════════════════════════════════════════════
+
+async function enhancePrompt(rawTranscription) {
+  try {
+    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: 'llama-3.3-70b-versatile',
+        max_tokens: 1000,
+        messages: [
+          {
+            role: 'system',
+            content: `You are a prompt engineer for an AI app/code builder.
+Your job is to take a rough voice note transcription and expand it into a detailed, specific, professional build prompt.
+
+RULES:
+- Keep the core idea exactly as intended
+- Add specific UI details (colors, layout, features) for web apps
+- Add technical requirements (responsive, dark theme, localStorage) for web apps
+- Add code quality requirements (error handling, comments, edge cases) for code requests
+- Add edge cases to handle
+- Keep it under 400 words
+- Output ONLY the enhanced prompt, nothing else
+- Do not add features the user didn't ask for
+- If it's a code request (VBA/Python/SQL/script), add code quality requirements instead of UI details`
+          },
+          {
+            role: 'user',
+            content: `Enhance this voice note into a detailed build prompt:\n\n"${rawTranscription}"`
+          }
+        ]
+      }),
+      signal: AbortSignal.timeout(15000)
+    });
+    const data = await response.json();
+    return data.choices?.[0]?.message?.content?.trim() || rawTranscription;
+  } catch (err) {
+    console.warn('[enhancePrompt] Failed, using raw transcription:', err.message);
+    return rawTranscription; // Fail silently
+  }
+}
+
+// ════════════════════════════════════════════════════════════
+//  UPGRADE 2 — CONTINUATION DETECTION
+// ════════════════════════════════════════════════════════════
+
+const CONTINUATION_PATTERNS = [
+  /^now\s/i,
+  /^also\s/i,
+  /^and\s+add\s/i,
+  /^add\s/i,
+  /^remove\s/i,
+  /\bthat\s+app\b/i,
+  /\bthe\s+app\b/i,
+  /\bsame\s+app\b/i,
+  /\bprevious\b/i,
+  /^change\s/i,
+  /^modify\s/i,
+  /^fix\s/i,
+  /^make\s+it\s/i,
+  /^make\s+the\s/i
+];
+
+// "update:" is already handled as its own command — exclude it here
+function isContinuation(text) {
+  const lower = text.toLowerCase();
+  if (lower.startsWith('update:') || lower.startsWith('update last')) return false;
+  return CONTINUATION_PATTERNS.some(re => re.test(text));
+}
+
+// ════════════════════════════════════════════════════════════
+//  CORE JOB RUNNER
 // ════════════════════════════════════════════════════════════
 
 async function runAgentJob(from, requirement, jobId, imageData = null, existingSiteId = null) {
@@ -97,20 +183,55 @@ async function runAgentJob(from, requirement, jobId, imageData = null, existingS
     jobs.set(jobId, { ...jobs.get(jobId), status: 'done', result });
 
     if (result.success) {
-      saveDeployment(from, {
-        siteId:      result.siteId   || existingSiteId || 'unknown',
-        siteName:    result.siteName || 'unknown',
-        siteUrl:     result.url,
-        requirement: requirement.slice(0, 200),
-        builtAt:     new Date().toISOString()
-      });
-      deductCredit(from);
+      // ── Gist output (VBA, Python, SQL, scripts) ────────────
+      if (result.isGist) {
+        // Save to conversation memory (for "now add X" continuations)
+        saveConversation(from, {
+          lastRequirement: requirement.slice(0, 200),
+          lastUrl:         result.url,
+          lastGistId:      result.gistId,
+          lastRawUrl:      result.rawUrl,
+          lastFilename:    result.filename,
+          lastSiteId:      null
+        });
+        deductCredit(from);
 
-      await sendWhatsApp(from,
-        `✅ *App is live!*\n\n` +
-        `🔗 ${result.url}\n\n` +
-        `📝 ${result.summary}`
-      );
+        await sendWhatsApp(from,
+          `✅ *Code is ready!*\n\n` +
+          `📄 File: ${result.filename || 'code'}\n` +
+          `🔗 View: ${result.url}\n` +
+          `📥 Raw: ${result.rawUrl || result.url}\n\n` +
+          `📋 Open the link to copy or download your code.\n` +
+          `💡 Tip: The Raw link gives you plain text to paste directly.`
+        );
+
+      // ── Web app output (Netlify) ───────────────────────────
+      } else {
+        saveDeployment(from, {
+          siteId:      result.siteId   || existingSiteId || 'unknown',
+          siteName:    result.siteName || 'unknown',
+          siteUrl:     result.url,
+          requirement: requirement.slice(0, 200),
+          builtAt:     new Date().toISOString()
+        });
+        // Save to conversation memory too
+        saveConversation(from, {
+          lastRequirement: requirement.slice(0, 200),
+          lastUrl:         result.url,
+          lastSiteId:      result.siteId || existingSiteId || null,
+          lastGistId:      null,
+          lastRawUrl:      null,
+          lastFilename:    null
+        });
+        deductCredit(from);
+
+        await sendWhatsApp(from,
+          `✅ *App is live!*\n\n` +
+          `🔗 ${result.url}\n\n` +
+          `📝 ${result.summary}`
+        );
+      }
+
     } else {
       await sendWhatsApp(from,
         `❌ *Build failed*\n\n${result.error}\n\nSend your requirement again to retry.`
@@ -129,43 +250,48 @@ async function runAgentJob(from, requirement, jobId, imageData = null, existingS
 }
 
 // ════════════════════════════════════════════════════════════
-//  VOICE NOTE HANDLER
+//  VOICE NOTE HANDLER  (with Upgrade 4 — prompt enhancement)
 // ════════════════════════════════════════════════════════════
 
 async function handleVoiceNote(from, mediaUrl, user) {
   const tempPath = path.join(os.tmpdir(), `voice-${Date.now()}.ogg`);
   try {
-    // 1. Download audio
     const response = await downloadTwilioMedia(mediaUrl);
-    const buffer = Buffer.from(await response.arrayBuffer());
+    const buffer   = Buffer.from(await response.arrayBuffer());
 
-    // 2. Size check (> 25 MB)
     if (buffer.length > 25 * 1024 * 1024) {
       return sendWhatsApp(from, '❌ Voice note too long. Please keep under 5 minutes.');
     }
 
     fs.writeFileSync(tempPath, buffer);
 
-    // 3. Transcribe with Groq Whisper
+    // Transcribe with Groq Whisper
     const transcription = await getGroq().audio.transcriptions.create({
-      file: fs.createReadStream(tempPath),
-      model: 'whisper-large-v3',
+      file:            fs.createReadStream(tempPath),
+      model:           'whisper-large-v3',
       response_format: 'text'
     });
 
-    const text = (typeof transcription === 'string' ? transcription : transcription.text || '').trim();
-    if (!text) throw new Error('Transcription returned empty text');
+    const rawText = (typeof transcription === 'string' ? transcription : transcription.text || '').trim();
+    if (!rawText) throw new Error('Transcription returned empty text');
+    console.log(`[Voice] Transcribed: ${rawText.slice(0, 100)}`);
 
-    console.log(`[Voice] Transcribed: ${text.slice(0, 100)}`);
+    // Enhance with Groq LLM
+    const enhancedPrompt = await enhancePrompt(rawText);
+    const previewText    = enhancedPrompt.slice(0, 150);
+    const isEnhanced     = enhancedPrompt !== rawText;
 
-    // 4. Notify user with transcription + building status
+    // Notify user
     await sendWhatsApp(from,
       `🎤 *Voice note received!*\n\n` +
-      `📝 Transcribed: "${text.slice(0, 100)}${text.length > 100 ? '..."' : '"'}\n\n` +
-      `⚙️ Building your app now! Usually 2-4 mins.`
+      `📝 You said: "${rawText.slice(0, 100)}${rawText.length > 100 ? '...' : '"}"\n\n` +
+      (isEnhanced
+        ? `✨ Enhanced to:\n"${previewText}${enhancedPrompt.length > 150 ? '...' : '"'}\n\n`
+        : '') +
+      `⚙️ Building now! Usually 2-4 mins.`
     );
 
-    // 5. Credit check
+    // Credit check
     const freshUser = getUser(from);
     if (!isOwner(from) && (!freshUser || freshUser.credits <= 0)) {
       return sendWhatsApp(from,
@@ -175,10 +301,9 @@ async function handleVoiceNote(from, mediaUrl, user) {
       );
     }
 
-    // 6. Run agent
     const jobId = Date.now().toString();
-    jobs.set(jobId, { status: 'running', task: text, startedAt: new Date() });
-    runAgentJob(from, text, jobId);
+    jobs.set(jobId, { status: 'running', task: rawText.slice(0, 80), startedAt: new Date() });
+    runAgentJob(from, enhancedPrompt, jobId);
 
   } catch (err) {
     console.error(`[Voice] Error: ${err.message}`);
@@ -199,20 +324,17 @@ async function handleVoiceNote(from, mediaUrl, user) {
 
 async function handleImage(from, mediaUrl, mediaContentType, user) {
   try {
-    // 1. Download image
     const response = await downloadTwilioMedia(mediaUrl);
-    const buffer = Buffer.from(await response.arrayBuffer());
+    const buffer   = Buffer.from(await response.arrayBuffer());
 
-    // 2. Size check (> 5 MB)
     if (buffer.length > 5 * 1024 * 1024) {
       return sendWhatsApp(from, '❌ Image too large. Please send a smaller screenshot.');
     }
 
-    const base64 = buffer.toString('base64');
+    const base64    = buffer.toString('base64');
     const mediaType = mediaContentType.split(';')[0].trim();
     const imageData = { base64, mediaType };
 
-    // 3. Credit check
     const freshUser = getUser(from);
     if (!isOwner(from) && (!freshUser || freshUser.credits <= 0)) {
       return sendWhatsApp(from,
@@ -222,7 +344,6 @@ async function handleImage(from, mediaUrl, mediaContentType, user) {
       );
     }
 
-    // 4. Run agent with vision
     const jobId = Date.now().toString();
     const requirement =
       'Clone this UI screenshot as a fully working web app. ' +
@@ -243,14 +364,14 @@ async function handleImage(from, mediaUrl, mediaContentType, user) {
 // ════════════════════════════════════════════════════════════
 
 app.post('/webhook', async (req, res) => {
-  const from          = req.body.From || '';               // whatsapp:+917025217998
-  const msgBody       = (req.body.Body || '').trim();
-  const numMedia      = parseInt(req.body.NumMedia || '0', 10);
-  const mediaType0    = req.body.MediaContentType0 || '';
-  const mediaUrl0     = req.body.MediaUrl0 || '';
+  const from       = req.body.From || '';
+  const msgBody    = (req.body.Body || '').trim();
+  const numMedia   = parseInt(req.body.NumMedia || '0', 10);
+  const mediaType0 = req.body.MediaContentType0 || '';
+  const mediaUrl0  = req.body.MediaUrl0 || '';
 
-  // ── User registration + first-time welcome ─────────────────
-  let user = getUser(from);
+  // ── User registration ─────────────────────────────────────
+  let user    = getUser(from);
   const isNew = !user;
   if (!user) user = registerUser(from);
 
@@ -281,8 +402,10 @@ app.post('/webhook', async (req, res) => {
       `🤖 *WhatsApp App Builder — Commands:*\n\n` +
       `📝 [any requirement] → Build a new app\n` +
       `🎤 [voice note] → Speak your requirement\n` +
-      `🖼️ [screenshot] → Clone any UI\n\n` +
+      `🖼️ [screenshot] → Clone any UI\n` +
+      `💻 VBA/Python/SQL/scripts → Auto-creates Gist\n\n` +
       `update: [changes] → Update your last app\n` +
+      `now/also/add [changes] → Continue last task\n` +
       `last app → See your most recent app\n` +
       `my apps → See your last 5 apps\n` +
       `delete last app → Remove last app\n` +
@@ -342,7 +465,6 @@ app.post('/webhook', async (req, res) => {
 
   // ── OWNER: GIVE CREDITS ───────────────────────────────────
   if (cmd.startsWith('give credits ') && isOwner(from)) {
-    // e.g. "give credits 10 +917025217998"
     const parts = msgBody.split(' ');
     if (parts.length >= 4) {
       const amount = parseInt(parts[2], 10);
@@ -357,6 +479,67 @@ app.post('/webhook', async (req, res) => {
     return twimlReply(res, `Usage: give credits [amount] [phone e.g. +917025217998]`);
   }
 
+  // ── UPGRADE 2: CONTINUATION ("now add X", "also Y", etc.) ─
+  if (msgBody && isContinuation(msgBody)) {
+    const conv = getConversation(from);
+    if (!conv) {
+      return twimlReply(res, `No previous task found. Please describe what you want to build from scratch!`);
+    }
+
+    // Credit check
+    const freshUser = getUser(from);
+    if (!isOwner(from) && (!freshUser || freshUser.credits <= 0)) {
+      return twimlReply(res,
+        `🎉 You've used all 3 free builds!\n\n` +
+        `💳 Want to continue? Payment options coming soon.\n` +
+        `📩 Message +917025217998 to request more credits.`
+      );
+    }
+
+    twimlReply(res,
+      `🔄 *Continuing your last task...*\n\n` +
+      `✏️ Change: "${msgBody.slice(0, 80)}${msgBody.length > 80 ? '...' : '"'}\n` +
+      `⏱️ Usually 2-4 mins. I'll send the updated link when ready!`
+    );
+
+    const jobId = Date.now().toString();
+    jobs.set(jobId, { status: 'running', task: msgBody, startedAt: new Date() });
+
+    // Web app continuation → fetch code from Netlify, redeploy same site
+    if (conv.lastSiteId) {
+      fetchExistingCode(conv.lastUrl)
+        .then(existingCode => {
+          const requirement = existingCode
+            ? `EXISTING CODE (from ${conv.lastUrl}):\n\n${existingCode}\n\nMODIFICATION REQUEST: ${msgBody}\n\nModify the existing code to implement the update. Keep everything that works. When deploying, use site_id="${conv.lastSiteId}" to redeploy to the same site.`
+            : `MODIFICATION REQUEST: ${msgBody}\n\nUpdate the app at ${conv.lastUrl}. When deploying, use site_id="${conv.lastSiteId}" to redeploy to the same site.`;
+          return runAgentJob(from, requirement, jobId, null, conv.lastSiteId);
+        })
+        .catch(err => {
+          const requirement = `MODIFICATION REQUEST: ${msgBody}\n\nUpdate the app at ${conv.lastUrl}. When deploying, use site_id="${conv.lastSiteId}".`;
+          runAgentJob(from, requirement, jobId, null, conv.lastSiteId);
+        });
+
+    // Code file continuation → fetch raw from Gist, create updated Gist
+    } else if (conv.lastGistId && conv.lastRawUrl) {
+      fetchGistCode(conv.lastRawUrl)
+        .then(existingCode => {
+          const requirement = existingCode
+            ? `EXISTING CODE (${conv.lastFilename || 'file'}):\n\n${existingCode}\n\nMODIFICATION REQUEST: ${msgBody}\n\nModify the existing code to add/change the requested feature. Keep all working functionality. Create an updated Gist with the modified code.`
+            : `MODIFICATION REQUEST: ${msgBody}\n\nUpdate the code from ${conv.lastUrl}. Create a new Gist with the modifications.`;
+          return runAgentJob(from, requirement, jobId);
+        })
+        .catch(() => {
+          runAgentJob(from, `MODIFICATION REQUEST: ${msgBody}\n\nContext: previous task was "${conv.lastRequirement}". Create an updated version.`, jobId);
+        });
+
+    } else {
+      // Fallback: use previous requirement as context
+      const requirement = `Previous task: "${conv.lastRequirement}"\nURL: ${conv.lastUrl}\n\nMODIFICATION REQUEST: ${msgBody}`;
+      runAgentJob(from, requirement, jobId);
+    }
+    return;
+  }
+
   // ── UPDATE: ────────────────────────────────────────────────
   if (cmd.startsWith('update:') || (cmd.startsWith('update ') && !cmd.startsWith('update last'))) {
     const updateText = msgBody.slice(msgBody.toLowerCase().startsWith('update:') ? 7 : 7).trim();
@@ -365,8 +548,7 @@ app.post('/webhook', async (req, res) => {
     const last = getLastDeployment(from);
     if (!last) return twimlReply(res, `No previous app found. Send a new requirement first!`);
 
-    // Credit check
-    user = getUser(from); // re-read fresh
+    user = getUser(from);
     if (!isOwner(from) && (!user || user.credits <= 0)) {
       return twimlReply(res,
         `🎉 You've used all 3 free builds!\n\n` +
@@ -377,24 +559,22 @@ app.post('/webhook', async (req, res) => {
 
     twimlReply(res,
       `🔄 *Updating your app...*\n\n` +
-      `📝 Change: "${updateText.slice(0, 80)}${updateText.length > 80 ? '..."' : '"'}\n` +
+      `📝 Change: "${updateText.slice(0, 80)}${updateText.length > 80 ? '...' : '"'}\n` +
       `⏱️ Usually 2-4 mins. I'll send the updated link when ready!`
     );
 
     const jobId = Date.now().toString();
     jobs.set(jobId, { status: 'running', task: `update: ${updateText}`, startedAt: new Date() });
 
-    // Fetch existing code then run agent
     fetchExistingCode(last.siteUrl)
       .then(existingCode => {
         const requirement = existingCode
-          ? `Here is the existing code for the app at ${last.siteUrl}:\n\n${existingCode}\n\nUPDATE REQUIREMENT: ${updateText}\n\nModify the existing code to implement the update. Keep everything that works, only change what's needed. When deploying, use site_id="${last.siteId}" to redeploy to the same site.`
+          ? `Here is the existing code for the app at ${last.siteUrl}:\n\n${existingCode}\n\nUPDATE REQUIREMENT: ${updateText}\n\nModify the existing code. Keep everything that works. When deploying, use site_id="${last.siteId}" to redeploy to the same site.`
           : `UPDATE REQUIREMENT: ${updateText}\n\nUpdate the app at ${last.siteUrl}. When deploying, use site_id="${last.siteId}" to redeploy to the same site.`;
         return runAgentJob(from, requirement, jobId, null, last.siteId);
       })
       .catch(err => {
-        console.error(`[Job ${jobId}] Update setup error: ${err.message}`);
-        const requirement = `UPDATE REQUIREMENT: ${updateText}\n\nUpdate the app at ${last.siteUrl}. When deploying, use site_id="${last.siteId}" to redeploy to the same site.`;
+        const requirement = `UPDATE REQUIREMENT: ${updateText}\n\nUpdate the app at ${last.siteUrl}. When deploying, use site_id="${last.siteId}".`;
         runAgentJob(from, requirement, jobId, null, last.siteId);
       });
     return;
@@ -404,7 +584,7 @@ app.post('/webhook', async (req, res) => {
   if (numMedia > 0 && mediaType0.includes('audio')) {
     twimlReply(res,
       `🎤 *Voice note received!*\n\n` +
-      `🔄 Transcribing with Whisper AI... give me a moment.`
+      `🔄 Transcribing + enhancing with AI... give me a moment.`
     );
     handleVoiceNote(from, mediaUrl0, user).catch(err => {
       console.error(`[Voice] Unhandled: ${err.message}`);
@@ -427,8 +607,8 @@ app.post('/webhook', async (req, res) => {
     return;
   }
 
-  // ── CREDIT CHECK (before building) ───────────────────────
-  user = getUser(from); // re-read fresh
+  // ── CREDIT CHECK ─────────────────────────────────────────
+  user = getUser(from);
   if (!isOwner(from) && (!user || user.credits <= 0)) {
     return twimlReply(res,
       `🎉 You've used all 3 free builds!\n\n` +
@@ -444,7 +624,7 @@ app.post('/webhook', async (req, res) => {
 
   twimlReply(res,
     `⚙️ Got it! Building your app now...\n\n` +
-    `📋 Task: "${msgBody.slice(0, 80)}${msgBody.length > 80 ? '..."' : '"'}\n\n` +
+    `📋 Task: "${msgBody.slice(0, 80)}${msgBody.length > 80 ? '...' : '"'}\n\n` +
     `⏱️ Usually takes 2–4 mins. I'll send the live link when it's ready!`
   );
 
@@ -455,11 +635,9 @@ app.post('/webhook', async (req, res) => {
 
 // ════════════════════════════════════════════════════════════
 //  MARKET DATA PROXY  (/market/*)
-//  Fetches from Yahoo Finance server-side (no CORS issues).
-//  Render's IP is not blocked by Yahoo Finance.
 // ════════════════════════════════════════════════════════════
 
-const marketCache = {};   // { key: { data, expiresAt } }
+const marketCache = {};
 
 function cacheGet(key) {
   const entry = marketCache[key];
@@ -477,12 +655,12 @@ const YF_HEADERS = {
   'Accept-Language': 'en-US,en;q=0.9'
 };
 
-async function fetchYahoo(path) {
+async function fetchYahoo(urlPath) {
   const hosts = ['query1.finance.yahoo.com', 'query2.finance.yahoo.com'];
   let lastErr;
   for (const host of hosts) {
     try {
-      const res = await fetch(`https://${host}${path}`, {
+      const res = await fetch(`https://${host}${urlPath}`, {
         headers: YF_HEADERS,
         signal: AbortSignal.timeout(10000)
       });
@@ -490,7 +668,7 @@ async function fetchYahoo(path) {
       return await res.json();
     } catch (err) {
       lastErr = err;
-      console.warn(`[Market] ${host} failed: ${err.message}, trying next...`);
+      console.warn(`[Market] ${host} failed: ${err.message}`);
     }
   }
   throw lastErr;
@@ -505,22 +683,19 @@ function extractQuote(data, symbol) {
     shortName: meta.shortName || meta.symbol || symbol,
     regularMarketPrice: meta.regularMarketPrice || meta.chartPreviousClose || null,
     regularMarketChange: meta.regularMarketPrice && meta.chartPreviousClose
-      ? parseFloat((meta.regularMarketPrice - meta.chartPreviousClose).toFixed(2))
-      : null,
+      ? parseFloat((meta.regularMarketPrice - meta.chartPreviousClose).toFixed(2)) : null,
     regularMarketChangePercent: meta.regularMarketPrice && meta.chartPreviousClose
-      ? parseFloat(((meta.regularMarketPrice - meta.chartPreviousClose) / meta.chartPreviousClose * 100).toFixed(2))
-      : null,
+      ? parseFloat(((meta.regularMarketPrice - meta.chartPreviousClose) / meta.chartPreviousClose * 100).toFixed(2)) : null,
     regularMarketVolume: meta.regularMarketVolume || null,
     fiftyTwoWeekHigh: meta.fiftyTwoWeekHigh || null,
-    fiftyTwoWeekLow: meta.fiftyTwoWeekLow || null,
-    currency: meta.currency || 'INR',
+    fiftyTwoWeekLow:  meta.fiftyTwoWeekLow  || null,
+    currency:     meta.currency     || 'INR',
     exchangeName: meta.exchangeName || null,
-    marketState: meta.marketState || 'UNKNOWN',
+    marketState:  meta.marketState  || 'UNKNOWN',
     previousClose: meta.chartPreviousClose || null
   };
 }
 
-// CORS middleware for all /market routes
 app.use('/market', (req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Headers', 'Content-Type');
@@ -529,112 +704,77 @@ app.use('/market', (req, res, next) => {
   next();
 });
 
-// GET /market/quote?symbols=^NSEI,^NSEBANK,RELIANCE.NS
 app.get('/market/quote', async (req, res) => {
   const symbolsParam = req.query.symbols || '^NSEI,^NSEBANK,^BSESN,RELIANCE.NS,TCS.NS';
   const symbols = symbolsParam.split(',').map(s => s.trim()).filter(Boolean);
   const cacheKey = `quote:${symbols.join(',')}`;
-
   const cached = cacheGet(cacheKey);
   if (cached) return res.json(cached);
-
   try {
     const results = await Promise.allSettled(
       symbols.map(async sym => {
-        const encoded = encodeURIComponent(sym);
-        const data = await fetchYahoo(`/v8/finance/chart/${encoded}?interval=1m&range=1d`);
+        const data = await fetchYahoo(`/v8/finance/chart/${encodeURIComponent(sym)}?interval=1m&range=1d`);
         return extractQuote(data, sym);
       })
     );
-
-    const quotes = results
-      .map((r, i) => r.status === 'fulfilled' ? r.value : { symbol: symbols[i], error: r.reason?.message })
-      .filter(Boolean);
-
-    cacheSet(cacheKey, quotes, 60 * 1000); // 60 second cache
+    const quotes = results.map((r, i) =>
+      r.status === 'fulfilled' ? r.value : { symbol: symbols[i], error: r.reason?.message }
+    );
+    cacheSet(cacheKey, quotes, 60 * 1000);
     res.json(quotes);
   } catch (err) {
-    console.error('[Market /quote] Error:', err.message);
     res.status(502).json({ error: 'Failed to fetch quotes', detail: err.message });
   }
 });
 
-// GET /market/history?symbol=^NSEI&interval=1d&range=1mo
 app.get('/market/history', async (req, res) => {
   const symbol   = req.query.symbol   || '^NSEI';
   const interval = req.query.interval || '1d';
   const range    = req.query.range    || '1mo';
   const cacheKey = `history:${symbol}:${interval}:${range}`;
-
   const cached = cacheGet(cacheKey);
   if (cached) return res.json(cached);
-
   try {
-    const encoded = encodeURIComponent(symbol);
-    const data = await fetchYahoo(`/v8/finance/chart/${encoded}?interval=${interval}&range=${range}`);
+    const data   = await fetchYahoo(`/v8/finance/chart/${encodeURIComponent(symbol)}?interval=${interval}&range=${range}`);
     const result = data?.chart?.result?.[0];
     if (!result) throw new Error(`No history data for ${symbol}`);
-
     const { timestamp, indicators } = result;
     const quote = indicators?.quote?.[0] || {};
-
     const payload = {
-      symbol,
-      interval,
-      range,
-      meta: {
-        currency: result.meta?.currency,
-        regularMarketPrice: result.meta?.regularMarketPrice,
-        chartPreviousClose: result.meta?.chartPreviousClose
-      },
+      symbol, interval, range,
+      meta: { currency: result.meta?.currency, regularMarketPrice: result.meta?.regularMarketPrice, chartPreviousClose: result.meta?.chartPreviousClose },
       timestamps: timestamp || [],
-      open:   quote.open   || [],
-      high:   quote.high   || [],
-      low:    quote.low    || [],
-      close:  quote.close  || [],
-      volume: quote.volume || []
+      open: quote.open || [], high: quote.high || [], low: quote.low || [], close: quote.close || [], volume: quote.volume || []
     };
-
-    cacheSet(cacheKey, payload, 5 * 60 * 1000); // 5 minute cache
+    cacheSet(cacheKey, payload, 5 * 60 * 1000);
     res.json(payload);
   } catch (err) {
-    console.error('[Market /history] Error:', err.message);
     res.status(502).json({ error: 'Failed to fetch history', detail: err.message });
   }
 });
 
-// GET /market/indices  — NIFTY50, BANKNIFTY, SENSEX, NIFTY IT
 app.get('/market/indices', async (req, res) => {
   const INDEX_SYMBOLS = [
-    { symbol: '^NSEI',   name: 'NIFTY 50'    },
-    { symbol: '^NSEBANK',name: 'BANK NIFTY'  },
-    { symbol: '^BSESN',  name: 'SENSEX'      },
-    { symbol: '^CNXIT',  name: 'NIFTY IT'    }
+    { symbol: '^NSEI',    name: 'NIFTY 50'   },
+    { symbol: '^NSEBANK', name: 'BANK NIFTY' },
+    { symbol: '^BSESN',   name: 'SENSEX'     },
+    { symbol: '^CNXIT',   name: 'NIFTY IT'   }
   ];
-  const cacheKey = 'indices';
-  const cached = cacheGet(cacheKey);
+  const cached = cacheGet('indices');
   if (cached) return res.json(cached);
-
   try {
     const results = await Promise.allSettled(
       INDEX_SYMBOLS.map(async ({ symbol, name }) => {
-        const encoded = encodeURIComponent(symbol);
-        const data = await fetchYahoo(`/v8/finance/chart/${encoded}?interval=1m&range=1d`);
-        const quote = extractQuote(data, symbol);
-        return { ...quote, displayName: name };
+        const data = await fetchYahoo(`/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1m&range=1d`);
+        return { ...extractQuote(data, symbol), displayName: name };
       })
     );
-
     const indices = results.map((r, i) =>
-      r.status === 'fulfilled'
-        ? r.value
-        : { symbol: INDEX_SYMBOLS[i].symbol, displayName: INDEX_SYMBOLS[i].name, error: r.reason?.message }
+      r.status === 'fulfilled' ? r.value : { symbol: INDEX_SYMBOLS[i].symbol, displayName: INDEX_SYMBOLS[i].name, error: r.reason?.message }
     );
-
-    cacheSet(cacheKey, indices, 60 * 1000); // 60 second cache
+    cacheSet('indices', indices, 60 * 1000);
     res.json(indices);
   } catch (err) {
-    console.error('[Market /indices] Error:', err.message);
     res.status(502).json({ error: 'Failed to fetch indices', detail: err.message });
   }
 });
@@ -645,7 +785,7 @@ app.get('/health', (req, res) => {
     status: 'ok',
     activeJobs: [...jobs.values()].filter(j => j.status === 'running').length,
     uptime: Math.floor(process.uptime()) + 's',
-    features: ['text', 'voice', 'image', 'history', 'update', 'users', 'market-proxy']
+    features: ['text', 'voice+enhance', 'image', 'history', 'update', 'users', 'gist', 'continuation', 'market-proxy']
   });
 });
 
@@ -653,5 +793,6 @@ app.get('/health', (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🤖 WhatsApp Agent running on port ${PORT}`);
-  console.log(`✅ Owner: +917025217998 | Features: voice, image, history, users`);
+  console.log(`✅ Phase 2: gist + conversation memory + voice enhancement`);
+  console.log(`✅ Owner: +917025217998`);
 });

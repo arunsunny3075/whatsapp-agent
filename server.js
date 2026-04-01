@@ -284,9 +284,9 @@ async function handleVoiceNote(from, mediaUrl, user) {
     // Notify user
     await sendWhatsApp(from,
       `🎤 *Voice note received!*\n\n` +
-      `📝 You said: "${rawText.slice(0, 100)}${rawText.length > 100 ? '...' : '"}"\n\n` +
+      `📝 You said: "${rawText.slice(0, 100)}${rawText.length > 100 ? '...' : ''}"\n\n` +
       (isEnhanced
-        ? `✨ Enhanced to:\n"${previewText}${enhancedPrompt.length > 150 ? '...' : '"'}\n\n`
+        ? `✨ Enhanced to:\n"${previewText}${enhancedPrompt.length > 150 ? '...' : ''}"\n\n`
         : '') +
       `⚙️ Building now! Usually 2-4 mins.`
     );

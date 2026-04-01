@@ -27,7 +27,14 @@ app.use(bodyParser.json());
 
 // ── Clients ─────────────────────────────────────────────────
 const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
-const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+
+// Groq is lazily initialized so missing key doesn't crash startup
+let _groq = null;
+function getGroq() {
+  if (!process.env.GROQ_API_KEY) throw new Error('GROQ_API_KEY not set — add it in Render env vars');
+  if (!_groq) _groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+  return _groq;
+}
 
 // ── In-memory job tracker ────────────────────────────────────
 const jobs = new Map();
@@ -140,7 +147,7 @@ async function handleVoiceNote(from, mediaUrl, user) {
     fs.writeFileSync(tempPath, buffer);
 
     // 3. Transcribe with Groq Whisper
-    const transcription = await groq.audio.transcriptions.create({
+    const transcription = await getGroq().audio.transcriptions.create({
       file: fs.createReadStream(tempPath),
       model: 'whisper-large-v3',
       response_format: 'text'
